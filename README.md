@@ -1,113 +1,146 @@
-# Config-Copilot 🚀
+# Config-Copilot - Intent-Driven Oracle ERP Configuration Agent
 
-AI-powered Oracle Fusion ERP configuration automation system that intelligently fills 187 questionnaire questions through multi-phase research and analysis.
+An AI-powered agent that understands what you want to configure in Oracle ERP and automatically finds and answers the relevant questions.
 
-## Features
+## 🚀 Quick Start
 
-- **9-Phase Research Pipeline**: Automated discovery across company profile, industry analysis, enterprise structure, chart of accounts, and more
-- **Smart Caching**: Reuses existing analysis to skip redundant processing
-- **Intelligent Questionnaire Filling**: Uses Claude API (Argus) to generate contextual answers
-- **Interactive UI**: Gradio-based interface with category-organized question display
-- **Batch Processing**: Efficient 3-phase parallel processing for faster results
+1. **Setup Qdrant** with your questions (must include `tags` field)
+2. **Configure** `.env` with Qdrant connection
+3. **Run** `python app.py`
+4. **Open** http://localhost:7860
 
-## Architecture
+## 📋 How It Works
+
+1. You describe what you want: *"I need to set up payroll and HR"*
+2. AI extracts Oracle module tags: `["payroll", "hr"]`
+3. Fetches relevant questions from Qdrant
+4. Pre-fills answers using company data
+5. Displays results with filters
+
+## 🏗️ Architecture
 
 ```
-config_copilot/
-├── app.py                          # Main Gradio application
-├── phase_extractors/               # Modular phase processors
-├── questionnaire_filler_argus.py   # Claude API integration for Q&A
-├── llm_wrapper.py                  # LLM API wrapper
-├── argus_wrapper.py                # Argus-specific wrapper
-└── oracle_system_questionnnaire.json  # Question template
+User Input (Company + Industry + Country + Prompt)
+    ↓
+Generate/Load Consolidated Company Data (9 phases)
+    ↓
+Analyze Intent → Extract Tags
+    ↓
+Fetch Questions from Qdrant (by tags)
+    ↓
+Pre-fill Answers (using company data)
+    ↓
+Display & Export
 ```
 
-## Installation
+## 🔑 Key Files
 
-1. **Clone the repository**
-```bash
-git clone https://github.com/yourusername/config-copilot.git
-cd config-copilot
-```
+- `app.py` - Main application
+- `qdrant_retriever.py` - Question retrieval
+- `intent_analyzer.py` - Intent extraction
+- `answer_filler.py` - Answer pre-filling
+- `phase_extractors/` - Company data generation
 
-2. **Create virtual environment**
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. **Install dependencies**
-```bash
-pip install -r requirements.txt
-```
-
-4. **Configure environment variables**
-```bash
-cp .env.example .env
-# Edit .env with your API keys
-```
-
-Required variables:
-- `ARGUS_MODEL_ID`: Your Claude model identifier
-- `ARGUS_API_KEY`: Your Anthropic API key
-- `TAVILY_API_KEY`: For web research
-- `OUTPUT_DIR`: Output directory path (default: `output`)
-
-## Usage
-
-1. **Start the application**
-```bash
-python app.py
-```
-
-2. **Access the web interface**
-- Open browser to `http://localhost:7860`
-
-3. **Generate configuration**
-- Enter company name, industry, and country
-- Click "Generate Configuration"
-- Wait for 9-phase processing (or instant load if cached)
-- Review and edit 187 questions organized by category
-
-## How It Works
-
-1. **Phase Processing**: 9 distinct research phases gather comprehensive company data
-2. **Consolidation**: Phase results merge into unified JSON structure
-3. **Intelligent Filling**: Claude API analyzes consolidated data and generates contextual answers
-4. **Interactive Review**: Category-organized UI for answer validation and editing
-
-## Tech Stack
-
-- **Frontend**: Gradio
-- **Backend**: FastAPI, Python 3.9+
-- **AI**: Claude API (Anthropic), Tavily Search API
-- **Data**: JSON-based storage with smart caching
-
-## Project Structure
-
-- **Phase Extractors**: Modular research phases (1-9)
-- **LLM Integration**: Async Claude API calls with retry logic
-- **State Management**: Global questionnaire data store
-- **Output Management**: Company-specific directories with versioning
-
-## Development
+## 📦 Requirements
 
 ```bash
-# Install in development mode
-pip install -e .
-
-# Run with debug logging
-LOG_LEVEL=DEBUG python app.py
+pip install gradio qdrant-client pandas python-dotenv tavily-python openai
 ```
 
-## License
+## ⚙️ Configuration
 
-MIT License - see LICENSE file for details
+Create `.env`:
+```bash
+# LLM API
+ARGUS_MODEL_ID=your-model
+ARGUS_API_KEY=your-key
+ARGUS_BASE_URL=your-url
 
-## Contributing
+# Tavily (for company research)
+TAVILY_API_KEY=your-key
 
-Contributions welcome! Please open an issue or submit a PR.
+# Qdrant (for questions)
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=oracle_questions
+```
 
-## Author
+## 🏷️ Question Format
 
-Mani Kiran Gadi - Opkey
+Your questions in Qdrant must have:
+
+```json
+{
+  "id": "Q001",
+  "categoryID": "Payroll_Configuration",
+  "questions": "What is the pay frequency?",
+  "mandatoryField": "Pay Frequency",
+  "isrequired": true,
+  "tags": ["payroll", "hr"]  // Critical for intent matching!
+}
+```
+
+## 🎯 Supported Tags
+
+Configure in `intent_analyzer.py`:
+
+- `payroll`, `hr`, `hcm` - Human resources
+- `gl`, `payables`, `receivables` - Finance
+- `fa` - Fixed assets
+- `procurement`, `inventory` - Supply chain
+- `projects`, `expenses` - Project management
+- `revenue`, `budgeting`, `tax` - Other modules
+
+## 📊 Output
+
+- Filtered questions based on intent
+- Pre-filled answers from company data
+- Exportable JSON: `output/{company}/filled_questionnaire.json`
+
+## 🧪 Testing
+
+```bash
+# Test Qdrant connection
+python test_qdrant.py
+
+# Run preflight check
+python preflight_check.py
+```
+
+## 📝 Example
+
+**Input:**
+```
+Company: Apple Inc.
+Industry: Technology
+Country: United States
+Prompt: I need payroll and HR setup
+```
+
+**Result:**
+- Generates Apple's company profile (9 phases)
+- Identifies tags: `["payroll", "hr", "hcm"]`
+- Fetches 50-60 relevant questions
+- Pre-fills all answers
+- Exports to JSON
+
+## 🔄 Smart Caching
+
+- **First run**: ~3-5 min (generates all company data)
+- **Subsequent runs**: ~30 sec (loads cached data)
+
+## 📚 Documentation
+
+- `START_HERE.md` - Quick start guide
+- `SETUP_GUIDE.md` - Detailed setup
+- `ARCHITECTURE.md` - System design
+
+## 🤝 Contributing
+
+This is a specialized Oracle ERP configuration tool. Customize:
+- Tags in `intent_analyzer.py`
+- Phase extractors in `phase_extractors/`
+- System prompts for better answers
+
+## 📄 License
+
+MIT

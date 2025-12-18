@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Config-Copilot - Gradio Interface with Category Dropdown Questionnaire
+Config-Copilot - Intent-Driven Oracle ERP Configuration Agent
 """
 
 # Fix for Python 3.13 audioop issue
@@ -11,22 +11,15 @@ sys.modules['audioop'] = MagicMock()
 # CRITICAL: Load environment variables FIRST before any other imports
 import os
 from dotenv import load_dotenv
-load_dotenv(override=True)  # Force reload to ensure we get latest values
-
-# Verify Argus configuration is loaded
-ARGUS_MODEL = os.getenv("ARGUS_MODEL_ID")
-if ARGUS_MODEL:
-    print(f"✅ Argus Model loaded in app.py: {ARGUS_MODEL}")
-else:
-    print("❌ WARNING: Argus configuration not found in app.py!")
+load_dotenv(override=True)
 
 import json
 import logging
 import asyncio
 import gradio as gr
+import pandas as pd
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -45,8 +38,10 @@ from phase_extractors import get_phase_extractor, get_available_phases
 # Import LLM wrapper
 from llm_wrapper import call_llm_api_async
 
-# Import questionnaire filler (using Argus API version)
-from questionnaire_filler_argus import fill_questionnaire_with_consolidated_data, export_questionnaire_to_json
+# Import new modules
+from qdrant_retriever import QuestionRetriever
+from intent_analyzer import extract_intent_tags, validate_and_expand_tags
+from answer_filler import prefill_answers_from_consolidated, export_filled_questions
 
 # Output directory
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output"))
@@ -77,8 +72,17 @@ PHASE_TO_SECTION_MAPPING = {
     9: "implementationPlanning"
 }
 
-# Global storage for questionnaire
+# Global storage
 QUESTIONNAIRE_DATA = {}
+CURRENT_FILLED_QUESTIONS = []
+
+# Initialize Question API retriever
+try:
+    question_retriever = QuestionRetriever()
+    logger.info("✅ Question API retriever initialized")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Question API: {e}")
+    question_retriever = None
 
 
 async def process_single_phase(company_name: str, industry: str, country: str, phase_num: int) -> Dict:
@@ -116,150 +120,8 @@ async def process_single_phase(company_name: str, industry: str, country: str, p
         return {"phase": phase_num, "status": "failed", "error": str(e)}
 
 
-async def generate_all_phases(company_name: str, industry: str, country: str, progress=gr.Progress()):
-    """Process all 9 phases in batches of 3"""
-    
-    global QUESTIONNAIRE_DATA
-    
-    if not company_name or not industry or not country:
-        return "❌ Error: All fields required!", [], [], False
-    
-    logger.info(f"🏢 Starting analysis for {company_name}")
-    
-    # Check if consolidated data already exists
-    company_output_dir = OUTPUT_DIR / company_name.replace(" ", "_").lower()
-    consolidated_file = company_output_dir / "consolidated.json"
-    
-    if consolidated_file.exists():
-        logger.info(f"📂 Found existing consolidated data for {company_name}, skipping phase processing")
-        progress(0.5, desc="Loading existing data...")
-        
-        try:
-            with open(consolidated_file, 'r') as f:
-                consolidated_data = json.load(f)
-            
-            logger.info(f"✅ Loaded existing consolidated data with {len(consolidated_data)} sections")
-            
-            # Jump directly to questionnaire filling
-            progress(0.9, desc="Filling questionnaire from existing data...")
-            
-            filled_questions = []
-            category_choices = []
-            
-            try:
-                logger.info(f"🔄 Calling Claude API to fill questionnaire...")
-                filled_questions = await fill_questionnaire_with_consolidated_data(
-                    consolidated_data, company_name, industry, country
-                )
-                
-                export_questionnaire_to_json(filled_questions, company_name, OUTPUT_DIR)
-                
-                # Store globally
-                QUESTIONNAIRE_DATA = {}
-                for q in filled_questions:
-                    category = q.get("categoryID", "General")
-                    if category not in QUESTIONNAIRE_DATA:
-                        QUESTIONNAIRE_DATA[category] = []
-                    QUESTIONNAIRE_DATA[category].append(q)
-                
-                category_choices = sorted(QUESTIONNAIRE_DATA.keys())
-                
-                logger.info(f"✅ Questionnaire: {len(filled_questions)} questions in {len(category_choices)} categories")
-                
-            except Exception as e:
-                logger.error(f"❌ Questionnaire failed: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-            
-            progress(1.0, desc="Complete!")
-            
-            summary = f"""
-## ✅ Configuration Ready for {company_name}
-
-**Select a category below to review and edit {len(filled_questions)} questions across {len(category_choices)} categories**
-"""
-            
-            return summary, filled_questions, category_choices, True
-            
-        except Exception as e:
-            logger.error(f"❌ Error loading existing data: {e}")
-            logger.info(f"⚠️ Will proceed with full processing")
-            # Continue with normal processing if loading fails
-    
-    # Normal processing continues here...
-    results = []
-    progress(0, desc="Starting analysis...")
-    
-    batch_size = 3
-    all_phases = list(range(1, 10))
-    
-    for batch_start in range(0, len(all_phases), batch_size):
-        batch_phases = all_phases[batch_start:batch_start + batch_size]
-        batch_num = (batch_start // batch_size) + 1
-        
-        progress(batch_start / 9, desc=f"Batch {batch_num}/3: Phases {batch_phases}...")
-        
-        tasks = [process_single_phase(company_name, industry, country, phase_num) for phase_num in batch_phases]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in batch_results:
-            if not isinstance(result, Exception):
-                results.append(result)
-        
-        if batch_start + batch_size < len(all_phases):
-            await asyncio.sleep(2)
-    
-    progress(0.95, desc="Consolidating...")
-    consolidated_result = await generate_consolidated_json(company_name)
-    
-    progress(0.97, desc="Filling questionnaire...")
-    
-    filled_questions = []
-    category_choices = []
-    
-    if consolidated_result["status"] == "success":
-        try:
-            filled_questions = await fill_questionnaire_with_consolidated_data(
-                consolidated_result["data"], company_name, industry, country
-            )
-            
-            export_questionnaire_to_json(filled_questions, company_name, OUTPUT_DIR)
-            
-            # Store globally
-            QUESTIONNAIRE_DATA = {}
-            for q in filled_questions:
-                category = q.get("categoryID", "General")
-                if category not in QUESTIONNAIRE_DATA:
-                    QUESTIONNAIRE_DATA[category] = []
-                QUESTIONNAIRE_DATA[category].append(q)
-            
-            category_choices = sorted(QUESTIONNAIRE_DATA.keys())
-            
-            logger.info(f"✅ Questionnaire: {len(filled_questions)} questions in {len(category_choices)} categories")
-            
-        except Exception as e:
-            logger.error(f"❌ Questionnaire failed: {e}")
-    
-    progress(1.0, desc="Complete!")
-    
-    completed = len([r for r in results if r["status"] == "completed"])
-    
-    summary = f"""
-## ✅ Configuration Ready for {company_name}
-
-**Select a category below to review and edit {len(filled_questions)} questions across {len(category_choices)} categories**
-"""
-    
-    return (
-        summary,
-        filled_questions,
-        category_choices,  # Just return the list
-        True  # visibility for questions_container
-    )
-
-
 async def generate_consolidated_json(company_name: str) -> Dict:
-    """Generate consolidated JSON"""
+    """Generate consolidated JSON from all phases"""
     try:
         company_output_dir = OUTPUT_DIR / company_name.replace(" ", "_").lower()
         consolidated_data = {}
@@ -276,230 +138,322 @@ async def generate_consolidated_json(company_name: str) -> Dict:
         with open(consolidated_file, 'w') as f:
             json.dump(consolidated_data, f, indent=2)
         
+        logger.info(f"✅ Consolidated data saved: {len(consolidated_data)} sections")
         return {"status": "success", "data": consolidated_data}
     except Exception as e:
+        logger.error(f"❌ Consolidation error: {e}")
         return {"status": "error", "error": str(e)}
 
 
-def display_category_questions(category_name: str) -> List:
-    """Display questions for selected category"""
+async def process_with_intent(
+    company_name: str, 
+    industry: str, 
+    country: str, 
+    user_prompt: str,
+    progress=gr.Progress()
+) -> Tuple[str, str, pd.DataFrame]:
+    """
+    Main processing pipeline with intent-driven question filtering
     
-    if not category_name or category_name not in QUESTIONNAIRE_DATA:
-        return []
+    Returns:
+        (status_markdown, intent_analysis_markdown, questions_dataframe)
+    """
     
-    questions = QUESTIONNAIRE_DATA[category_name]
+    global QUESTIONNAIRE_DATA, CURRENT_FILLED_QUESTIONS
     
-    components = [
-        gr.Markdown(f"## 📂 {category_name.replace('_', ' ')}"),
-        gr.Markdown(f"*{len(questions)} questions in this category*"),
-        gr.Markdown("---")
-    ]
+    if not all([company_name, industry, country, user_prompt]):
+        return "❌ Error: All fields are required!", "", pd.DataFrame()
     
-    for q in questions:
-        q_id = q["id"]
-        question_text = q.get("questions", "")
-        mandatory_field = q.get("mandatoryField", "")
-        answer = q.get("answer", "")
-        is_required = q.get("isrequired", False)
+    try:
+        # Step 1: Check for existing consolidated data or generate it
+        progress(0.1, desc="Step 1/5: Checking consolidated data...")
+        logger.info(f"🏢 Processing: {company_name}")
         
-        req_icon = "✅" if is_required else "⚪"
-        label = f"{req_icon} Q{q_id}: {mandatory_field}"
+        company_output_dir = OUTPUT_DIR / company_name.replace(" ", "_").lower()
+        consolidated_file = company_output_dir / "consolidated.json"
         
-        components.append(
-            gr.Textbox(
-                label=label,
-                value=answer if answer else "",
-                placeholder="",
-                lines=1,
-                interactive=True,
-                info=question_text if question_text else None
-            )
+        if consolidated_file.exists():
+            logger.info(f"📂 Found existing consolidated data for {company_name}")
+            with open(consolidated_file, 'r') as f:
+                consolidated_data = json.load(f)
+        else:
+            logger.info(f"🔄 Generating consolidated data for {company_name}...")
+            progress(0.2, desc="Generating company data (9 phases)...")
+            
+            # Process all phases
+            results = []
+            batch_size = 3
+            all_phases = list(range(1, 10))
+            
+            for batch_start in range(0, len(all_phases), batch_size):
+                batch_phases = all_phases[batch_start:batch_start + batch_size]
+                batch_num = (batch_start // batch_size) + 1
+                
+                progress(0.2 + (batch_start / 9 * 0.3), desc=f"Processing batch {batch_num}/3...")
+                
+                tasks = [process_single_phase(company_name, industry, country, p) for p in batch_phases]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for result in batch_results:
+                    if not isinstance(result, Exception):
+                        results.append(result)
+                
+                if batch_start + batch_size < len(all_phases):
+                    await asyncio.sleep(2)
+            
+            progress(0.5, desc="Consolidating data...")
+            consolidated_result = await generate_consolidated_json(company_name)
+            
+            if consolidated_result["status"] != "success":
+                return f"❌ Failed to generate consolidated data: {consolidated_result.get('error')}", "", pd.DataFrame()
+            
+            consolidated_data = consolidated_result["data"]
+        
+        # Step 2: Analyze user intent
+        progress(0.6, desc="Step 2/5: Analyzing your intent...")
+        logger.info(f"🤔 Analyzing intent from prompt: {user_prompt[:100]}...")
+        
+        intent_result = await extract_intent_tags(user_prompt, company_name, industry, country)
+        extracted_tags = intent_result.get("tags", [])
+        reasoning = intent_result.get("reasoning", "")
+        focus_areas = intent_result.get("focus_areas", [])
+        
+        intent_md = f"""## 🎯 Intent Analysis
+
+**Identified Oracle Modules**: {', '.join(extracted_tags)}
+
+**Reasoning**: {reasoning}
+
+**Focus Areas**: {', '.join(focus_areas)}
+"""
+        
+        # Step 3: Fetch questions from Question API
+        progress(0.7, desc="Step 3/5: Fetching relevant questions...")
+        
+        if not question_retriever:
+            return "❌ Question API retriever not available", intent_md, pd.DataFrame()
+        
+        # Validate tags against available tags
+        available_tags = question_retriever.get_all_available_tags()
+        valid_tags = await validate_and_expand_tags(extracted_tags, available_tags)
+        
+        if not valid_tags:
+            return f"❌ No valid tags found. Available tags: {available_tags[:10]}", intent_md, pd.DataFrame()
+        
+        logger.info(f"✅ Using tags: {valid_tags}")
+        questions = question_retriever.fetch_questions_by_tags(valid_tags)
+        
+        if not questions:
+            return f"❌ No questions found for tags: {valid_tags}", intent_md, pd.DataFrame()
+        
+        logger.info(f"📋 Retrieved {len(questions)} questions")
+        
+        # Step 4: Pre-fill answers using consolidated data
+        progress(0.8, desc="Step 4/5: Pre-filling answers...")
+        
+        filled_questions = await prefill_answers_from_consolidated(
+            questions=questions,
+            consolidated_data=consolidated_data,
+            company=company_name,
+            industry=industry,
+            country=country
         )
-    
-    return components
+        
+        # Step 5: Export and display
+        progress(0.9, desc="Step 5/5: Preparing results...")
+        
+        export_path = export_filled_questions(filled_questions, company_name, OUTPUT_DIR)
+        logger.info(f"💾 Exported to: {export_path}")
+        
+        # Store globally for category filtering
+        CURRENT_FILLED_QUESTIONS = filled_questions
+        QUESTIONNAIRE_DATA = {}
+        for q in filled_questions:
+            category = q.get("categoryID", "General")
+            if category not in QUESTIONNAIRE_DATA:
+                QUESTIONNAIRE_DATA[category] = []
+            QUESTIONNAIRE_DATA[category].append(q)
+        
+        # Create DataFrame for display - ONLY Question and Answer
+        df = pd.DataFrame([
+            {
+                "Question": q["questions"],
+                "Answer": q.get("answer", "")
+            }
+            for q in filled_questions
+        ])
+        
+        progress(1.0, desc="Complete!")
+        
+        status_md = f"""## ✅ Configuration Ready
+
+**Company**: {company_name}  
+**Questions Retrieved**: {len(filled_questions)}  
+**Categories**: {len(QUESTIONNAIRE_DATA)}  
+**Export Location**: `{export_path}`
+
+You can now review and edit the answers below. Select a category to filter questions.
+"""
+        
+        return status_md, intent_md, df
+        
+    except Exception as e:
+        logger.error(f"❌ Processing error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return f"❌ Error: {str(e)}", "", pd.DataFrame()
 
 
-def format_category_questions_as_markdown(category_name: str) -> str:
-    """Format category questions as markdown for display"""
+def filter_by_category(category_name: str, current_df: pd.DataFrame) -> pd.DataFrame:
+    """Filter questions by selected category"""
     
-    if not category_name or category_name not in QUESTIONNAIRE_DATA:
-        return "**No questions found**"
+    if not category_name or category_name == "All":
+        return current_df
     
-    questions = QUESTIONNAIRE_DATA[category_name]
+    if category_name not in QUESTIONNAIRE_DATA:
+        return pd.DataFrame(columns=["Question", "Answer"])
     
-    markdown = f"## 📂 {category_name.replace('_', ' ')}\n\n"
-    markdown += f"*{len(questions)} questions in this category*\n\n"
-    markdown += "---\n\n"
+    category_questions = QUESTIONNAIRE_DATA[category_name]
     
-    for q in questions:
-        q_id = q["id"]
-        question_text = q.get("questions", "")
-        mandatory_field = q.get("mandatoryField", "")
-        answer = q.get("answer", "")
-        is_required = q.get("isrequired", False)
-        
-        req_icon = "✅" if is_required else "⚪"
-        
-        markdown += f"### {req_icon} Q{q_id}: {mandatory_field}\n\n"
-        
-        if question_text:
-            markdown += f"**Question**: {question_text}\n\n"
-        
-        if answer:
-            markdown += f"**Answer**: `{answer}`\n\n"
-        else:
-            markdown += f"**Answer**: *Not filled*\n\n"
-        
-        markdown += "---\n\n"
+    # Create filtered dataframe with only questions from this category
+    filtered_df = pd.DataFrame([
+        {
+            "Question": q["questions"],
+            "Answer": q.get("answer", "")
+        }
+        for q in category_questions
+    ])
     
-    return markdown
-
-
-def generate_textbox_updates_for_category(category_name: str) -> List:
-    """Generate gr.update() objects for textboxes based on selected category"""
-    
-    if not category_name or category_name not in QUESTIONNAIRE_DATA:
-        # Hide all textboxes if no category
-        return [gr.update(visible=False) for _ in range(50)]
-    
-    questions = QUESTIONNAIRE_DATA[category_name]
-    updates = []
-    
-    for i in range(50):
-        if i < len(questions):
-            q = questions[i]
-            q_id = q["id"]
-            question_text = q.get("questions", "")
-            mandatory_field = q.get("mandatoryField", "")
-            answer = q.get("answer", "")
-            is_required = q.get("isrequired", False)
-            
-            req_icon = "✅" if is_required else "⚪"
-            label = f"{req_icon} Q{q_id}: {mandatory_field}"
-            
-            # Create update with visible textbox
-            updates.append(gr.update(
-                label=label,
-                value=answer if answer else "",
-                visible=True,
-                interactive=True,
-                info=question_text if question_text else None,
-                placeholder="Enter answer here..."
-            ))
-        else:
-            # Hide unused textboxes
-            updates.append(gr.update(visible=False))
-    
-    return updates
+    return filtered_df
 
 
 def create_gradio_interface():
     """Create Gradio interface"""
     
-    with gr.Blocks(title="Config-Copilot", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="Config-Copilot Agent", theme=gr.themes.Soft()) as app:
         gr.Markdown("""
-        # 🚀 OpKey ERP Configuration - Oracle Fusion Setup
+        # 🤖 Config-Copilot - Oracle ERP Configuration Agent
         
-        Generate Oracle Fusion ERP configuration with auto-filled questionnaire (187 questions)
+        **Intent-Driven Configuration**: Tell us what you want to configure, and we'll fetch and answer relevant questions.
         
-        **Tip**: If you've already processed a company, just enter the same name to reload existing data!
+        ### How it works:
+        1. **Generate/Load Data**: We create consolidated company data (or load existing)
+        2. **Understand Intent**: AI analyzes your prompt to identify relevant Oracle modules
+        3. **Fetch Questions**: Retrieve questions from Question API based on identified tags
+        4. **Pre-fill Answers**: Automatically answer questions using company data
+        5. **Review & Edit**: You can review and modify answers before export
         """)
         
         with gr.Row():
-            company_input = gr.Textbox(label="Company Name", placeholder="e.g., Apple Inc.")
-            industry_input = gr.Textbox(label="Industry", placeholder="e.g., Technology")
-            country_input = gr.Textbox(label="Country", placeholder="e.g., United States")
+            with gr.Column(scale=1):
+                company_input = gr.Textbox(
+                    label="Company Name",
+                    placeholder="e.g., Apple Inc.",
+                    info="Enter the company name"
+                )
+            with gr.Column(scale=1):
+                industry_input = gr.Textbox(
+                    label="Industry",
+                    placeholder="e.g., Technology",
+                    info="Company's industry sector"
+                )
+            with gr.Column(scale=1):
+                country_input = gr.Textbox(
+                    label="Country",
+                    placeholder="e.g., United States",
+                    info="Primary country of operation"
+                )
+        
+        prompt_input = gr.Textbox(
+            label="What do you want to configure?",
+            placeholder="e.g., I need to set up payroll and HR management for our new employees",
+            lines=3,
+            info="Describe what you want to configure in Oracle ERP"
+        )
         
         generate_btn = gr.Button("🚀 Generate Configuration", variant="primary", size="lg")
         
         gr.Markdown("---")
         
-        summary_output = gr.Markdown()
+        status_output = gr.Markdown()
+        intent_output = gr.Markdown()
         
-        gr.Markdown("## 📋 Oracle System Questionnaire")
+        gr.Markdown("## 📊 Questions & Answers")
         
-        # Questionnaire state
-        questions_state = gr.State([])
-        
-        # Category selector
         with gr.Row():
-            category_dropdown = gr.Dropdown(
-                label="Select Category",
-                choices=[],
-                visible=False,
+            category_filter = gr.Dropdown(
+                label="Filter by Category",
+                choices=["All"],
+                value="All",
                 interactive=True
             )
         
-        # Container for dynamic question textboxes (max 50 questions per category should be enough)
-        with gr.Column(visible=False) as questions_container:
-            gr.Markdown("### Questions will appear here after selecting a category")
-            # Pre-create a pool of textboxes (we'll show/hide as needed)
-            question_textboxes = []
-            for i in range(50):  # Maximum 50 questions per category
-                textbox = gr.Textbox(
-                    label=f"Question {i+1}",
-                    visible=False,
-                    interactive=True,
-                    lines=1
-                )
-                question_textboxes.append(textbox)
+        questions_df = gr.Dataframe(
+            label="Questions",
+            interactive=False,
+            wrap=True
+        )
+        
+        gr.Markdown("""
+        ### 💡 Tips:
+        - If data already exists for a company, it will be loaded instantly
+        - Be specific in your prompt to get the most relevant questions
+        - All answers are pre-filled but can be edited in the exported JSON file
+        - Check the export location in the status message above
+        """)
+        
+        # Store the full dataframe
+        full_df_state = gr.State(pd.DataFrame())
         
         # Generate button click
-        def on_generate_click(c, i, co):
-            summary, questions, categories, show_container = asyncio.run(generate_all_phases(c, i, co))
+        def on_generate(company, industry, country, prompt):
+            status, intent, df = asyncio.run(
+                process_with_intent(company, industry, country, prompt)
+            )
             
-            # Update dropdown choices and visibility
-            if categories:
-                dropdown_choices = categories
-                dropdown_value = categories[0]
-                dropdown_visible = True
-                
-                # Generate updates for first category
-                first_category_updates = generate_textbox_updates_for_category(categories[0])
+            # Update category choices from global QUESTIONNAIRE_DATA
+            if QUESTIONNAIRE_DATA:
+                categories = ["All"] + sorted(QUESTIONNAIRE_DATA.keys())
             else:
-                dropdown_choices = []
-                dropdown_value = None
-                dropdown_visible = False
-                first_category_updates = [gr.update(visible=False) for _ in range(50)]
+                categories = ["All"]
             
-            outputs = [
-                summary,
-                questions,
-                gr.Dropdown(choices=dropdown_choices, value=dropdown_value, visible=dropdown_visible, interactive=True, label="Select Category"),
-                gr.update(visible=show_container)
-            ]
-            outputs.extend(first_category_updates)
-            
-            return outputs
+            return (
+                status,
+                intent,
+                df,
+                df,  # full_df_state
+                gr.Dropdown(choices=categories, value="All")
+            )
         
         generate_btn.click(
-            fn=on_generate_click,
-            inputs=[company_input, industry_input, country_input],
-            outputs=[summary_output, questions_state, category_dropdown, questions_container] + question_textboxes
+            fn=on_generate,
+            inputs=[company_input, industry_input, country_input, prompt_input],
+            outputs=[status_output, intent_output, questions_df, full_df_state, category_filter]
         )
         
-        # Category selection change
-        def on_category_change(category):
-            if not category:
-                return [gr.update(visible=False) for _ in range(50)]
-            
-            return generate_textbox_updates_for_category(category)
+        # Category filter change
+        def on_category_filter(category, full_df):
+            if full_df.empty:
+                return full_df
+            return filter_by_category(category, full_df)
         
-        category_dropdown.change(
-            fn=on_category_change,
-            inputs=[category_dropdown],
-            outputs=question_textboxes
+        category_filter.change(
+            fn=on_category_filter,
+            inputs=[category_filter, full_df_state],
+            outputs=[questions_df]
         )
-        
-
     
     return app
 
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting Config-Copilot with Argus API")
-    argus_model = os.getenv("ARGUS_MODEL_ID", "Argus")
-    logger.info(f"✅ Using Argus Model: {argus_model}")
+    logger.info("🚀 Starting Config-Copilot Agent with Intent Analysis")
+    
+    # Check Question API configuration
+    api_url = os.getenv("QUESTION_API_URL", "https://runpodroute.preprod.opkeyone.com/GenericRAGDev/api/v1/query/search")
+    collection = os.getenv("QUESTION_COLLECTION", "questionnaire_items")
+    logger.info(f"📊 Question API: {api_url}")
+    logger.info(f"📊 Collection: {collection}")
     
     OUTPUT_DIR.mkdir(exist_ok=True)
     
