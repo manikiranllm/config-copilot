@@ -143,7 +143,48 @@ async def initialize_agent(company: str, industry: str, country: str, initial_pr
 def create_questions_html(agent: ConversationalAgent, selected_category: str = None) -> str:
     """Create HTML for questions panel with tabs"""
     
-    if not agent or agent.state["phase"] == "generating":
+    if not agent:
+        return """
+        <div style='padding: 30px; text-align: center; background: #f8f9fa; border-radius: 10px;'>
+            <div style='font-size: 48px; margin-bottom: 20px;'>👋</div>
+            <h3 style='color: #666;'>Welcome to Config-Copilot</h3>
+            <p style='color: #999;'>Fill in the details above and click "Start Configuration" to begin.</p>
+        </div>
+        """
+    
+    if agent.state["phase"] == "prerequisites":
+        # Show prerequisite progress
+        prereq_state = agent.prerequisite_manager.state
+        total = len(prereq_state["questions"])
+        answered = len(prereq_state["answers"])
+        progress_pct = (answered / total * 100) if total > 0 else 0
+        
+        return f"""
+        <div style='padding: 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                    color: white; border-radius: 10px;'>
+            <div style='font-size: 48px; margin-bottom: 20px; text-align: center;'>📋</div>
+            <h3 style='text-align: center; margin-bottom: 20px;'>Discovery Phase</h3>
+            
+            <div style='background: rgba(255,255,255,0.2); border-radius: 10px; padding: 15px; margin-bottom: 20px;'>
+                <div style='display: flex; justify-content: space-between; margin-bottom: 10px;'>
+                    <span>Progress</span>
+                    <span><strong>{answered}/{total}</strong> questions</span>
+                </div>
+                <div style='width: 100%; background: rgba(0,0,0,0.2); border-radius: 10px; height: 10px;'>
+                    <div style='width: {progress_pct}%; background: white; border-radius: 10px; height: 100%;'></div>
+                </div>
+            </div>
+            
+            <div style='background: rgba(255,255,255,0.15); border-radius: 8px; padding: 15px;'>
+                <p style='margin: 0; font-size: 14px; opacity: 0.9;'>
+                    💬 Answering prerequisite questions to understand your requirements.
+                    Your answers will help pre-configure the system optimally.
+                </p>
+            </div>
+        </div>
+        """
+    
+    if agent.state["phase"] == "generating":
         return """
         <div style='padding: 30px; text-align: center; background: #f8f9fa; border-radius: 10px;'>
             <div style='font-size: 48px; margin-bottom: 20px;'>⏳</div>
@@ -276,6 +317,21 @@ def create_status_html(agent: Optional[ConversationalAgent]) -> str:
         <div style='padding: 15px; background: #e3f2fd; border-left: 4px solid #2196f3; border-radius: 5px;'>
             <strong>👋 Welcome to Config-Copilot</strong>
             <p style='margin: 10px 0 0 0; color: #666;'>Fill in the details above and click "Start Configuration" to begin.</p>
+        </div>
+        """
+    
+    if agent.state["phase"] == "prerequisites":
+        prereq_state = agent.prerequisite_manager.state
+        answered = len(prereq_state["answers"])
+        total = len(prereq_state["questions"])
+        
+        return f"""
+        <div style='padding: 15px; background: #f3e5f5; border-left: 4px solid #9c27b0; border-radius: 5px;'>
+            <strong>📋 Discovery Phase</strong>
+            <p style='margin: 10px 0 0 0; color: #666;'>
+                Answering prerequisite questions ({answered}/{total} completed). 
+                Your answers help me understand your requirements better.
+            </p>
         </div>
         """
     
@@ -479,6 +535,14 @@ def create_gradio_interface():
         # Event handlers
         async def on_start(company, industry, country, initial_prompt):
             result = await handle_start_configuration(company, industry, country, initial_prompt)
+            # Wait a moment for agent initialization
+            await asyncio.sleep(1)
+            
+            # Get the initial bot message from agent if it exists
+            if agent and agent.get_last_assistant_message():
+                initial_chat = [(None, agent.get_last_assistant_message())]
+                return result[0], result[1], result[2], initial_chat, result[4]
+            
             return result
         
         start_btn.click(
@@ -521,28 +585,39 @@ def create_gradio_interface():
             yield history, "", gr.update(interactive=False)
             
             # Get bot response (this also runs analysis)
-            if agent and agent.state["phase"] != "generating":
-                bot_response = await agent.process_message(message)
-                
-                # Get the analysis from conversation history if available
-                if agent.state["conversation_history"]:
-                    last_entry = agent.state["conversation_history"][-1]
-                    if "analysis" in last_entry:
-                        analysis = last_entry["analysis"]
-                        reasoning = analysis.get("reasoning", "")
-                        
-                        if reasoning:
-                            # Show analysis first, then response
-                            analysis_msg = f"📊 **Analysis:** {reasoning}\n\n---\n\n{bot_response}"
-                            history[-1] = (message, analysis_msg)
+            if agent:
+                if agent.state["phase"] == "prerequisites":
+                    # In prerequisite phase - get answer directly
+                    bot_response = await agent.process_message(message)
+                    history[-1] = (message, bot_response)
+                    
+                elif agent.state["phase"] == "generating":
+                    bot_response = "⏳ Please wait while I finish analyzing your company data..."
+                    history[-1] = (message, bot_response)
+                    
+                else:
+                    # Normal conversation phase
+                    bot_response = await agent.process_message(message)
+                    
+                    # Get the analysis from conversation history if available
+                    if agent.state["conversation_history"]:
+                        last_entry = agent.state["conversation_history"][-1]
+                        if "analysis" in last_entry:
+                            analysis = last_entry["analysis"]
+                            reasoning = analysis.get("reasoning", "")
+                            
+                            if reasoning:
+                                # Show analysis first, then response
+                                analysis_msg = f"📊 **Analysis:** {reasoning}\n\n---\n\n{bot_response}"
+                                history[-1] = (message, analysis_msg)
+                            else:
+                                history[-1] = (message, bot_response)
                         else:
                             history[-1] = (message, bot_response)
                     else:
                         history[-1] = (message, bot_response)
-                else:
-                    history[-1] = (message, bot_response)
             else:
-                bot_response = "⏳ Please wait while I finish analyzing your company data..."
+                bot_response = "⚠️ Please start configuration first."
                 history[-1] = (message, bot_response)
             
             yield history, "", gr.update(interactive=True)

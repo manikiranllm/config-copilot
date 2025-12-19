@@ -14,6 +14,7 @@ from llm_wrapper import call_llm_api_async
 from qdrant_retriever import QuestionRetriever
 from intent_analyzer import extract_intent_tags, validate_and_expand_tags
 from answer_filler import prefill_answers_from_consolidated
+from prerequisite_questions import PrerequisiteManager
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class ConversationalAgent:
         self.country = country
         self.output_dir = output_dir
         self.question_retriever = QuestionRetriever()
+        self.prerequisite_manager = PrerequisiteManager()
         
         # Agent state
         self.state = {
@@ -55,13 +57,15 @@ class ConversationalAgent:
             "categories": {},  # category -> [questions]
             "conversation_history": [],
             "extracted_facts": {},  # Facts extracted from conversation
-            "phase": "not_started",  # not_started -> generating -> ready -> conversing -> error
+            "phase": "not_started",  # not_started -> prerequisites -> generating -> ready -> conversing -> error
+            "prerequisites_complete": False,
             "last_update": None
         }
     
     async def initialize(self, initial_prompt: str):
         """
         Initialize agent:
+        0. Ask prerequisite questions (if needed)
         1. Generate/load consolidated data (9 phases)
         2. Analyze initial intent
         3. Fetch and pre-fill questions
@@ -69,16 +73,12 @@ class ConversationalAgent:
         """
         
         try:
-            self.state["phase"] = "generating"
             logger.info(f"🤖 Initializing agent for {self.company}")
             
-            # Step 1: Get consolidated data
-            logger.info("📊 Step 1/4: Getting consolidated company data...")
-            consolidated_data = await self._get_or_generate_consolidated()
-            self.state["consolidated_data"] = consolidated_data
+            # Step 0: Check if we need prerequisite questions
+            logger.info("📋 Step 0/5: Checking prerequisite requirements...")
             
-            # Step 2: Analyze initial intent
-            logger.info("🤔 Step 2/4: Analyzing initial intent...")
+            # Quick intent analysis to determine if prerequisites needed
             intent_result = await extract_intent_tags(
                 initial_prompt,
                 self.company,
@@ -88,6 +88,40 @@ class ConversationalAgent:
             
             initial_tags = intent_result.get("tags", [])
             self.state["current_tags"] = initial_tags
+            
+            # Initialize prerequisites
+            prereq_result = await self.prerequisite_manager.initialize_prerequisites(
+                initial_tags,
+                initial_prompt
+            )
+            
+            if prereq_result["required_count"] > 0:
+                # Prerequisites needed - enter prerequisite phase
+                self.state["phase"] = "prerequisites"
+                self.state["prerequisites_complete"] = False
+                
+                # Store initial message
+                self.state["conversation_history"].append({
+                    "role": "assistant",
+                    "content": prereq_result["initial_message"],
+                    "timestamp": datetime.now().isoformat(),
+                    "type": "prerequisite_start"
+                })
+                
+                logger.info(f"   ℹ️ Entering prerequisite phase: {prereq_result['required_count']} questions")
+                return  # Don't proceed to generation yet
+            
+            # No prerequisites needed, continue to generation
+            self.state["prerequisites_complete"] = True
+            self.state["phase"] = "generating"
+            
+            # Step 1: Get consolidated data
+            logger.info("📊 Step 1/4: Getting consolidated company data...")
+            consolidated_data = await self._get_or_generate_consolidated()
+            self.state["consolidated_data"] = consolidated_data
+            
+            # Step 2: Intent already analyzed above
+            logger.info("🤔 Step 2/4: Using initial intent analysis...")
             
             # Step 3: Fetch questions from RAG
             logger.info(f"📋 Step 3/4: Fetching questions for tags: {initial_tags}")
@@ -138,6 +172,7 @@ class ConversationalAgent:
         Process user message and dynamically update configuration
         
         Flow:
+        0. If in prerequisite phase, handle prerequisite Q&A
         1. Analyze user message + current context
         2. Extract new facts/requirements
         3. Determine if new questions needed
@@ -146,8 +181,13 @@ class ConversationalAgent:
         """
         
         try:
-            self.state["phase"] = "conversing"
             logger.info(f"💬 Processing message: {user_message[:100]}...")
+            
+            # Step 0: Handle prerequisite phase
+            if self.state["phase"] == "prerequisites":
+                return await self._handle_prerequisite_message(user_message)
+            
+            self.state["phase"] = "conversing"
             
             # Add to history
             self.state["conversation_history"].append({
@@ -200,6 +240,163 @@ class ConversationalAgent:
             import traceback
             logger.error(traceback.format_exc())
             return f"⚠️ I encountered an error: {str(e)}. Please try rephrasing your question."
+    
+    async def _handle_prerequisite_message(self, user_message: str) -> str:
+        """
+        Handle user messages during prerequisite question phase
+        """
+        
+        try:
+            logger.info("📋 Processing prerequisite answer")
+            
+            # Add to history
+            self.state["conversation_history"].append({
+                "role": "user",
+                "content": user_message,
+                "timestamp": datetime.now().isoformat(),
+                "type": "prerequisite_answer"
+            })
+            
+            # Process answer through prerequisite manager
+            result = await self.prerequisite_manager.process_answer(user_message)
+            
+            # Add response to history
+            self.state["conversation_history"].append({
+                "role": "assistant",
+                "content": result["response"],
+                "timestamp": datetime.now().isoformat(),
+                "type": "prerequisite_question" if not result["is_complete"] else "prerequisite_complete"
+            })
+            
+            # Check if prerequisites are complete
+            if result["is_complete"]:
+                logger.info("✅ Prerequisites complete, starting configuration generation")
+                self.state["prerequisites_complete"] = True
+                self.state["phase"] = "generating"
+                
+                # Store prerequisite answers in extracted_facts
+                prereq_summary = self.prerequisite_manager.get_answers_summary()
+                self.state["extracted_facts"]["prerequisite_answers"] = prereq_summary["answers"]
+                
+                # Start background task to generate configuration
+                asyncio.create_task(self._complete_initialization_after_prerequisites())
+                
+                return result["response"]
+            
+            # More questions to go
+            return result["response"]
+            
+        except Exception as e:
+            logger.error(f"❌ Error handling prerequisite: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return "I had trouble understanding that. Could you please rephrase your answer?"
+    
+    async def _complete_initialization_after_prerequisites(self):
+        """
+        Complete initialization after prerequisites are collected
+        Run this in background while showing progress to user
+        """
+        
+        try:
+            logger.info("🚀 Completing initialization with prerequisite data")
+            
+            # Step 1: Get consolidated data
+            logger.info("📊 Step 1/3: Getting consolidated company data...")
+            consolidated_data = await self._get_or_generate_consolidated()
+            self.state["consolidated_data"] = consolidated_data
+            
+            # Enhance consolidated data with prerequisite answers
+            await self._enhance_consolidated_with_prerequisites(consolidated_data)
+            
+            # Step 2: Fetch questions
+            logger.info(f"📋 Step 2/3: Fetching questions for tags: {self.state['current_tags']}")
+            questions = self.question_retriever.fetch_questions_by_tags(self.state['current_tags'])
+            
+            if not questions:
+                logger.warning("⚠️ No questions found, using default tags")
+                questions = self.question_retriever.fetch_questions_by_tags(["core hr", "payroll"])
+            
+            # Step 3: Pre-fill answers
+            logger.info(f"✍️ Step 3/3: Pre-filling {len(questions)} answers...")
+            filled_questions = await prefill_answers_from_consolidated(
+                questions,
+                consolidated_data,
+                self.company,
+                self.industry,
+                self.country
+            )
+            
+            self.state["all_questions"] = filled_questions
+            self.state["displayed_questions"] = filled_questions
+            self._organize_questions_by_category()
+            
+            # Generate completion message
+            completion_message = f"""✅ **Configuration Ready!**
+
+I've generated your baseline configuration based on:
+- ✓ Your prerequisite answers
+- ✓ Company analysis ({self.company})
+- ✓ Industry best practices ({self.industry})
+
+📋 **Found {len(filled_questions)} configuration questions** across {len(self.state['categories'])} categories.
+
+💬 You can now:
+- Review and refine any configuration items
+- Ask questions about specific settings  
+- Request changes to pre-filled answers
+- Add new modules or features
+
+What would you like to explore first?"""
+            
+            self.state["conversation_history"].append({
+                "role": "assistant",
+                "content": completion_message,
+                "timestamp": datetime.now().isoformat(),
+                "type": "configuration_ready"
+            })
+            
+            self.state["phase"] = "ready"
+            self.state["last_update"] = datetime.now().isoformat()
+            
+            logger.info("✅ Initialization complete with prerequisites")
+            
+        except Exception as e:
+            logger.error(f"❌ Error completing initialization: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.state["phase"] = "error"
+    
+    async def _enhance_consolidated_with_prerequisites(self, consolidated_data: Dict):
+        """
+        Enhance consolidated data with information from prerequisite answers
+        """
+        
+        try:
+            prereq_summary = self.prerequisite_manager.get_answers_summary()
+            
+            if not prereq_summary["answers"]:
+                return
+            
+            logger.info("📝 Enhancing consolidated data with prerequisite answers")
+            
+            # Create a structured summary of prerequisite answers
+            prereq_text = "\n".join([
+                f"{ans['question']}: {ans['answer']}"
+                for ans in prereq_summary["answers"].values()
+            ])
+            
+            # Add to relevant sections of consolidated data
+            if "companyProfile" in consolidated_data:
+                consolidated_data["companyProfile"]["_prerequisite_insights"] = prereq_text
+            
+            if "processWorkflow" in consolidated_data:
+                consolidated_data["processWorkflow"]["_prerequisite_insights"] = prereq_text
+            
+            logger.info("   ✅ Enhanced consolidated data with prerequisites")
+            
+        except Exception as e:
+            logger.error(f"Error enhancing consolidated data: {e}")
     
     async def _get_or_generate_consolidated(self) -> Dict:
         """Generate or load consolidated company data"""
@@ -625,3 +822,12 @@ Generate your response:"""
             q_str.append(f"- [{q['id']}] {q['questions']}: {q.get('answer', 'N/A')[:100]}")
         
         return "\n".join(q_str)
+    
+    def get_last_assistant_message(self) -> Optional[str]:
+        """Get the last assistant message from conversation history"""
+        
+        for msg in reversed(self.state["conversation_history"]):
+            if msg["role"] == "assistant":
+                return msg["content"]
+        
+        return None
