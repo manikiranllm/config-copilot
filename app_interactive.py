@@ -58,6 +58,7 @@ PHASE_TO_SECTION_MAPPING = {
 
 # Global agent instance
 agent = None
+_initialization_in_progress = False
 
 
 async def process_single_phase(company_name: str, industry: str, country: str, phase_num: int) -> Dict:
@@ -122,22 +123,33 @@ async def generate_consolidated_json(company_name: str) -> Dict:
 
 async def initialize_agent(company: str, industry: str, country: str, initial_prompt: str):
     """Initialize the conversational agent with company data"""
-    global agent
+    global agent, _initialization_in_progress
     
-    logger.info(f"🤖 Initializing agent for {company}")
+    # Prevent duplicate initialization
+    if _initialization_in_progress:
+        logger.warning("⚠️ Duplicate initialization prevented")
+        while _initialization_in_progress:
+            await asyncio.sleep(0.1)
+        return agent
     
-    # Create agent instance
-    agent = ConversationalAgent(
-        company=company,
-        industry=industry,
-        country=country,
-        output_dir=OUTPUT_DIR
-    )
-    
-    # Start initialization in background
-    await agent.initialize(initial_prompt)
-    
-    return agent
+    _initialization_in_progress = True
+    try:
+        logger.info(f"🤖 Initializing agent for {company}")
+        
+        # Create agent instance
+        agent = ConversationalAgent(
+            company=company,
+            industry=industry,
+            country=country,
+            output_dir=OUTPUT_DIR
+        )
+        
+        # Initialize WITHOUT prerequisites - skip directly to question retrieval
+        await agent.initialize(initial_prompt, skip_prerequisites=True)
+        
+        return agent
+    finally:
+        _initialization_in_progress = False
 
 
 def create_questions_html(agent: ConversationalAgent, selected_category: str = None) -> str:
@@ -152,43 +164,11 @@ def create_questions_html(agent: ConversationalAgent, selected_category: str = N
         </div>
         """
     
-    if agent.state["phase"] == "prerequisites":
-        # Show prerequisite progress
-        prereq_state = agent.prerequisite_manager.state
-        total = len(prereq_state["questions"])
-        answered = len(prereq_state["answers"])
-        progress_pct = (answered / total * 100) if total > 0 else 0
-        
-        return f"""
-        <div style='padding: 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                    color: white; border-radius: 10px;'>
-            <div style='font-size: 48px; margin-bottom: 20px; text-align: center;'>📋</div>
-            <h3 style='text-align: center; margin-bottom: 20px;'>Discovery Phase</h3>
-            
-            <div style='background: rgba(255,255,255,0.2); border-radius: 10px; padding: 15px; margin-bottom: 20px;'>
-                <div style='display: flex; justify-content: space-between; margin-bottom: 10px;'>
-                    <span>Progress</span>
-                    <span><strong>{answered}/{total}</strong> questions</span>
-                </div>
-                <div style='width: 100%; background: rgba(0,0,0,0.2); border-radius: 10px; height: 10px;'>
-                    <div style='width: {progress_pct}%; background: white; border-radius: 10px; height: 100%;'></div>
-                </div>
-            </div>
-            
-            <div style='background: rgba(255,255,255,0.15); border-radius: 8px; padding: 15px;'>
-                <p style='margin: 0; font-size: 14px; opacity: 0.9;'>
-                    💬 Answering prerequisite questions to understand your requirements.
-                    Your answers will help pre-configure the system optimally.
-                </p>
-            </div>
-        </div>
-        """
-    
     if agent.state["phase"] == "generating":
         return """
         <div style='padding: 30px; text-align: center; background: #f8f9fa; border-radius: 10px;'>
             <div style='font-size: 48px; margin-bottom: 20px;'>⏳</div>
-            <h3 style='color: #666;'>Generating Company Data...</h3>
+            <h3 style='color: #666;'>Analyzing Company Data...</h3>
             <p style='color: #999;'>Running 9-phase analysis. This may take 2-3 minutes.</p>
         </div>
         """
@@ -317,21 +297,6 @@ def create_status_html(agent: Optional[ConversationalAgent]) -> str:
         <div style='padding: 15px; background: #e3f2fd; border-left: 4px solid #2196f3; border-radius: 5px;'>
             <strong>👋 Welcome to Config-Copilot</strong>
             <p style='margin: 10px 0 0 0; color: #666;'>Fill in the details above and click "Start Configuration" to begin.</p>
-        </div>
-        """
-    
-    if agent.state["phase"] == "prerequisites":
-        prereq_state = agent.prerequisite_manager.state
-        answered = len(prereq_state["answers"])
-        total = len(prereq_state["questions"])
-        
-        return f"""
-        <div style='padding: 15px; background: #f3e5f5; border-left: 4px solid #9c27b0; border-radius: 5px;'>
-            <strong>📋 Discovery Phase</strong>
-            <p style='margin: 10px 0 0 0; color: #666;'>
-                Answering prerequisite questions ({answered}/{total} completed). 
-                Your answers help me understand your requirements better.
-            </p>
         </div>
         """
     
@@ -527,9 +492,10 @@ def create_gradio_interface():
         ### 💡 How it works:
         1. **Fill the form above** with your company details and what you want to configure
         2. **Click "Start Configuration"** - The system will analyze your company (takes 2-3 minutes)
-        3. **Chat naturally** - Ask questions, provide clarifications, and refine your configuration
-        4. **Watch the left panel** - Questions and answers update dynamically as you chat
-        5. **Export when ready** - Your configuration is saved automatically
+        3. **View questions immediately** - All relevant questions appear in the left panel
+        4. **Chat naturally** - Ask questions, provide clarifications, and refine your configuration
+        5. **Watch live updates** - Answers update dynamically as you chat
+        6. **Export when ready** - Your configuration is saved automatically
         """)
         
         # Event handlers
@@ -558,21 +524,6 @@ def create_gradio_interface():
             outputs=[questions_panel]
         )
         
-        async def on_chat(message, history):
-            # Add user message immediately
-            history = history + [(message, None)]
-            yield history, "", gr.update(interactive=False)
-            
-            # Get bot response
-            bot_response = await agent.process_message(message) if agent else "Please start configuration first."
-            history[-1] = (message, bot_response)
-            
-            yield history, "", gr.update(interactive=True)
-            
-            # Refresh questions panel
-            status_html, questions_html = await refresh_questions_panel()
-            yield history, "", gr.update(interactive=True)
-        
         # Chat submission with typing indicator
         async def on_chat_with_typing(message, history):
             """Handle chat with typing indicator"""
@@ -584,14 +535,9 @@ def create_gradio_interface():
             history = history + [(message, "🤔 Thinking...")]
             yield history, "", gr.update(interactive=False)
             
-            # Get bot response (this also runs analysis)
+            # Get bot response
             if agent:
-                if agent.state["phase"] == "prerequisites":
-                    # In prerequisite phase - get answer directly
-                    bot_response = await agent.process_message(message)
-                    history[-1] = (message, bot_response)
-                    
-                elif agent.state["phase"] == "generating":
+                if agent.state["phase"] == "generating":
                     bot_response = "⏳ Please wait while I finish analyzing your company data..."
                     history[-1] = (message, bot_response)
                     

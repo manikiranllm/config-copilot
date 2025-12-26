@@ -62,14 +62,18 @@ class ConversationalAgent:
             "last_update": None
         }
     
-    async def initialize(self, initial_prompt: str):
+    async def initialize(self, initial_prompt: str, skip_prerequisites: bool = False):
         """
         Initialize agent:
-        0. Ask prerequisite questions (if needed)
+        0. Ask prerequisite questions (if needed and not skipped)
         1. Generate/load consolidated data (9 phases)
         2. Analyze initial intent
         3. Fetch and pre-fill questions
         4. Generate initial response
+        
+        Args:
+            initial_prompt: User's initial configuration request
+            skip_prerequisites: If True, skip prerequisite phase and show questions immediately
         """
         
         try:
@@ -89,31 +93,37 @@ class ConversationalAgent:
             initial_tags = intent_result.get("tags", [])
             self.state["current_tags"] = initial_tags
             
-            # Initialize prerequisites
-            prereq_result = await self.prerequisite_manager.initialize_prerequisites(
-                initial_tags,
-                initial_prompt
-            )
-            
-            if prereq_result["required_count"] > 0:
-                # Prerequisites needed - enter prerequisite phase
-                self.state["phase"] = "prerequisites"
-                self.state["prerequisites_complete"] = False
+            # Check if we should skip prerequisites
+            if skip_prerequisites:
+                logger.info("⏩ Skipping prerequisite phase as requested")
+                self.state["prerequisites_complete"] = True
+                self.state["phase"] = "generating"
+            else:
+                # Initialize prerequisites
+                prereq_result = await self.prerequisite_manager.initialize_prerequisites(
+                    initial_tags,
+                    initial_prompt
+                )
                 
-                # Store initial message
-                self.state["conversation_history"].append({
-                    "role": "assistant",
-                    "content": prereq_result["initial_message"],
-                    "timestamp": datetime.now().isoformat(),
-                    "type": "prerequisite_start"
-                })
+                if prereq_result["required_count"] > 0:
+                    # Prerequisites needed - enter prerequisite phase
+                    self.state["phase"] = "prerequisites"
+                    self.state["prerequisites_complete"] = False
+                    
+                    # Store initial message
+                    self.state["conversation_history"].append({
+                        "role": "assistant",
+                        "content": prereq_result["initial_message"],
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "prerequisite_start"
+                    })
+                    
+                    logger.info(f"   ℹ️ Entering prerequisite phase: {prereq_result['required_count']} questions")
+                    return  # Don't proceed to generation yet
                 
-                logger.info(f"   ℹ️ Entering prerequisite phase: {prereq_result['required_count']} questions")
-                return  # Don't proceed to generation yet
-            
-            # No prerequisites needed, continue to generation
-            self.state["prerequisites_complete"] = True
-            self.state["phase"] = "generating"
+                # No prerequisites needed, continue to generation
+                self.state["prerequisites_complete"] = True
+                self.state["phase"] = "generating"
             
             # Step 1: Get consolidated data
             logger.info("📊 Step 1/4: Getting consolidated company data...")
