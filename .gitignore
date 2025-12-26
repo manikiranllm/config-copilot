@@ -33,4 +33,4 @@ config_copilot.log
 *.xlsx
 
 # Phase data cache
-phases_data/
+
